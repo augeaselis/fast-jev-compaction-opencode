@@ -5,11 +5,13 @@ import { join } from 'node:path';
 
 import {
   FastJevCompaction,
+  createAsker,
   resolveConfig,
   serializeCompaction,
   toCompactionMessages,
   type NativeMessage,
 } from '../src/plugin.js';
+import type { Logger } from '../src/log.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -33,10 +35,11 @@ describe('resolveConfig', () => {
     const config = resolveConfig({ backend: 'systemone', localModel: 'tev1:0.8b' });
     expect(config.backend).toBe('systemone');
     expect(config.maxStateTokens).toBe(8_000);
-    expect(config.maxRequestTokens).toBe(10_000);
+    expect(config.maxRequestTokens).toBe(12_500);
+    expect(config.maxCallsPerBatch).toBe(32);
     expect(resolveConfig({
-      backend: 'systemone', maxStateTokens: 4000, maxRequestTokens: 5000,
-    }).maxStateTokens).toBe(4000);
+      backend: 'systemone', maxStateTokens: 4000, maxRequestTokens: 5000, maxCallsPerBatch: 8,
+    })).toMatchObject({ maxStateTokens: 4000, maxRequestTokens: 5000, maxCallsPerBatch: 8 });
   });
 
   it('carries a local bearer token without conflating it with the TypeSafe key', () => {
@@ -290,5 +293,38 @@ describe('OpenCode V2 adapter', () => {
     expect(readFileSync(logFile, 'utf8')).toContain(
       '"reason":"no-eligible-completed-tool-calls"',
     );
+  });
+});
+
+describe('createAsker', () => {
+  it('caps concurrent System One requests at localConcurrency', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      inFlight -= 1;
+      const body = JSON.parse(String(init?.body)) as { questions: Record<string, unknown> };
+      const answers = Object.fromEntries(
+        Object.keys(body.questions).map((name) => [name, { noul: 0.4 }]),
+      );
+      return new Response(JSON.stringify({ answers }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const config = resolveConfig({
+      backend: 'systemone',
+      localModel: 'decision_text',
+      localConcurrency: 2,
+    });
+    const asker = createAsker(config, { info() {}, warn() {}, error() {} } as Logger);
+
+    const state = { context: 'Fix tests', goal: 'Keep evidence', history: [] };
+    const questions = { call_t1: { type: 'noul' as const, instructions: 'Keep the call?' } };
+    await Promise.all([1, 2, 3, 4].map(() => asker.ask(state, questions)));
+
+    expect(peak).toBe(2);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 });

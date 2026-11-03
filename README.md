@@ -245,12 +245,15 @@ decision-model identifier. `localBaseUrl` accepts a server origin
 `/v1/systemone` endpoint. It defaults to LM Studio's `http://127.0.0.1:1234/v1`.
 
 The plugin sends one request containing the compact state and a batch of yes/no
-(`noul`) questions; responses are probabilities between 0 and 1. To respect
-Ollama's local limits, batches contain at most **64 questions** and stay under a
-conservative **60 KiB UTF-8 JSON** request size. Additional batches reuse the same
-state. The plugin defaults to `maxStateTokens: 8000` and
-`maxRequestTokens: 10000` in System One mode; both can be overridden if your
-loaded model supports more context.
+(`noul`) questions; responses are probabilities between 0 and 1. Servers cap one
+request at **64 questions** (the hosted gateway rejects more), and local endpoints
+stay under a conservative **60 KiB UTF-8 JSON** request size. Batches therefore hold
+at most **32 tool calls** — `maxCallsPerBatch`, default `32` in System One mode — and
+additional batches reuse the same state. The plugin defaults to `maxStateTokens: 8000`
+and `maxRequestTokens: 12500` in System One mode, room for a full 32-call batch; both
+can be overridden if your loaded model supports more context. `localConcurrency`
+caps how many of those requests are in flight at once on this machine, so several
+batches from one compaction cannot oversubscribe a shared decision pool.
 
 A small decision model may have a shorter context window than the request limit.
 For example, [Ollama's Tev1 0.8B model](https://ollama.com/library/tev1)
@@ -455,12 +458,13 @@ current OpenCode V2 compaction hook can express.
 | `localBaseUrl` | `http://127.0.0.1:1234/v1` | Local server base; System One accepts origin, `/v1`, or full `/v1/systemone` URL |
 | `localModel` | legacy: `jev-style-qwen3.5-2b-decision-mlx` | Required explicitly for `systemone`; decision model ID from your local server |
 | `localApiKey` | none | Optional bearer token for a proxied local endpoint |
-| `localConcurrency` | `2` | Parallel decisions for legacy `local` chat backend |
+| `localConcurrency` | `2` | Requests in flight at once (`systemone` and legacy `local` backends) |
 | `localContextTokens` | `64000` | Legacy chat-backend safety ceiling; must not exceed loaded context |
 | `keepThreshold` | `0.5` | Minimum probability to retain a call/result |
 | `preserveRecentMessages` | `6` | Newest adapted messages that are always pinned |
 | `maxStateTokens` | `25000` (`8000` System One) | Estimated JEV state ceiling |
-| `maxRequestTokens` | `30000` (`10000` System One) | Estimated core state + question budget |
+| `maxRequestTokens` | `30000` (`12500` System One) | Estimated core state + question budget |
+| `maxCallsPerBatch` | unlimited (`32` System One) | Tool calls one request asks about; 32 calls = the 64-question server cap |
 | `truncateHeadChars` | `300` | Characters retained when only a result is dropped |
 | `minReductionRatio` | `0.25` | Fall back to native compaction below this reduction |
 | `logFile` | OpenCode data log path | Override diagnostics file |

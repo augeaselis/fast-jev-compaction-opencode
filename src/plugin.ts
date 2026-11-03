@@ -2,7 +2,7 @@ import { Plugin } from '@opencode/plugin';
 
 import { JevClient } from './client.js';
 import { compact, reductionRatio, resolveOptions } from './compact.js';
-import { LOCAL_BASE_URL, LOCAL_MODEL, LocalJevAsker } from './local.js';
+import { LOCAL_BASE_URL, LOCAL_MODEL, LocalJevAsker, createScheduler } from './local.js';
 import { createLogger, defaultLogPath, errorSummary, safeUrl, type Logger } from './log.js';
 import { collectToolCalls } from './state.js';
 import { LOCAL_SYSTEM_ONE_BASE_URL, SystemOneClient, systemOneEndpoint } from './systemone.js';
@@ -93,7 +93,10 @@ export function resolveConfig(options: PluginOptions = {}): FastJevConfig {
   // Smaller default state avoids exceeding Ollama's 64 KiB text/schema limit.
   if (backend === 'systemone') {
     config.maxStateTokens = 8_000;
-    config.maxRequestTokens = 10_000;
+    // A gateway request holds at most 64 questions; 32 calls x 2 questions fill it,
+    // and the token ceiling is set just past that so the call count is what binds.
+    config.maxRequestTokens = 12_500;
+    config.maxCallsPerBatch = 32;
   }
 
   for (const key of [
@@ -101,6 +104,7 @@ export function resolveConfig(options: PluginOptions = {}): FastJevConfig {
     'preserveRecentMessages',
     'maxStateTokens',
     'maxRequestTokens',
+    'maxCallsPerBatch',
     'truncateHeadChars',
   ] as const) {
     const value = options[key];
@@ -264,9 +268,12 @@ function partCensus(messages: readonly NativeMessage[]): {
   return { roles, parts };
 }
 
-function createAsker(config: FastJevConfig, logger: Logger): JevAsker {
+export function createAsker(config: FastJevConfig, logger: Logger): JevAsker {
   if (config.backend === 'systemone') {
-    return new SystemOneClient({
+    // Batches are classified concurrently; this is the node-wide cap on requests
+    // in flight, so one compaction cannot oversubscribe the decision pool.
+    const schedule = createScheduler(config.localConcurrency);
+    const client = new SystemOneClient({
       baseUrl: config.localBaseUrl,
       model: config.localModel ?? '',
       apiKey: config.localApiKey,
@@ -295,6 +302,9 @@ function createAsker(config: FastJevConfig, logger: Logger): JevAsker {
         }
       },
     });
+    return {
+      ask: (state, questions) => schedule(() => client.ask(state, questions)),
+    };
   }
   if (config.backend === 'local') {
     return new LocalJevAsker({
