@@ -443,6 +443,7 @@ export const FastJevCompaction = Plugin.define({
               chunks: summary.chunkCount,
               model: config.fallbackModel,
               transcriptTokens,
+              truncatedMessages: summary.truncatedMessages,
             },
           };
           logger.info('compaction outcome', {
@@ -451,6 +452,7 @@ export const FastJevCompaction = Plugin.define({
             fallback: 'chunked-summary',
             chunks: summary.chunkCount,
             truncatedMessages: summary.truncatedMessages,
+            transcriptTokens,
           });
         } catch (error) {
           logger.warn('chunked fallback failed', {

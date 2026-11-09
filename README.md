@@ -213,7 +213,10 @@ Calls without completed results are never candidates.
 ### Safe fallback
 
 Nothing is dropped without a classifier answer. If a request fails, unanswered calls
-default to keep. If the overall reduction is below `minReductionRatio`, the plugin
+default to keep. Partial answers are never thrown away either: when some batches
+answered, the plugin applies them and only lets go of its own checkpoint if the
+reduction still misses `minReductionRatio` (shipped with a `partial: true` flag
+otherwise). If the overall reduction is below `minReductionRatio`, the plugin
 leaves OpenCode's compaction result untouched so native compaction can run.
 
 ### Observable
@@ -429,10 +432,13 @@ On a compaction request:
 1. OpenCode supplies the transcript to the V2 compaction hook.
 2. The plugin adapts the transcript to the fast-JEV message model.
 3. Completed tool calls are paired with their results.
-4. JEV classifies eligible calls/results.
+4. JEV classifies eligible calls/results — the history is fitted into one state,
+   or sliced into consecutive buckets when it cannot fit one.
 5. The plugin rebuilds the retained transcript.
 6. If reduction reaches `minReductionRatio`, the plugin supplies its own checkpoint.
-7. Otherwise OpenCode's normal compaction path remains available.
+7. Otherwise OpenCode's normal compaction path remains available — or, with
+   `fallbackModel` set and an oversized transcript, the plugin's chunked summarizer
+   does (see [Chunked fallback](#chunked-fallback)).
 
 ### Current OpenCode limitation
 
@@ -462,12 +468,95 @@ current OpenCode V2 compaction hook can express.
 | `localContextTokens` | `64000` | Legacy chat-backend safety ceiling; must not exceed loaded context |
 | `keepThreshold` | `0.5` | Minimum probability to retain a call/result |
 | `preserveRecentMessages` | `6` | Newest adapted messages that are always pinned |
-| `maxStateTokens` | `25000` (`8000` System One) | Estimated JEV state ceiling |
-| `maxRequestTokens` | `30000` (`12500` System One) | Estimated core state + question budget |
+| `maxStateTokens` | `25000` (`8000` System One) | Estimated JEV state ceiling; lower when `serverContextTokens` is set |
+| `maxRequestTokens` | `30000` (`12500` System One) | Estimated core state + question budget; lower when `serverContextTokens` is set |
 | `maxCallsPerBatch` | unlimited (`32` System One) | Tool calls one request asks about; 32 calls = the 64-question server cap |
 | `truncateHeadChars` | `300` | Characters retained when only a result is dropped |
+| `serverContextTokens` | none | Decision server's binding prompt ceiling; derives `requestBudget` and caps `maxStateTokens`/`maxRequestTokens` |
 | `minReductionRatio` | `0.25` | Fall back to native compaction below this reduction |
 | `logFile` | OpenCode data log path | Override diagnostics file |
+| `fallbackModel` | none | Model for the plugin's chunked summarizer fallback (e.g. `small_summarizer`) |
+| `fallbackBaseUrl` | `localBaseUrl` | Base URL the fallback summarizer model is served at |
+| `fallbackApiKey` | `localApiKey` | Bearer token for the fallback summarizer endpoint |
+| `fallbackContextTokens` | `131072` | Fallback summarizer's context window; chunks use 60% of it |
+
+## Sizing to the decision server
+
+Pooled decision models have a **binding prompt ceiling** — the `max_model_len` of the
+serving rung (`serverContextTokens`). A request over it gets HTTP 400, and the
+whole compaction used to fall back with every answered batch discarded.
+
+When it is set, the plugin derives its request budgets from it instead of the
+configured ones:
+
+- `REQUEST_MARGIN = 0.1`: a request runs under the ceiling by a tenth, which covers
+  the chat-template overhead and the estimator's documented 2–18% slack.
+- `requestBudget = floor(serverContextTokens * (1 - REQUEST_MARGIN))`.
+- `maxRequestTokens = min(configured, requestBudget)`.
+- The state shares one request with its batches' questions, so
+  `maxStateTokens = min(configured, requestBudget - maxCallsPerBatch * TOKENS_PER_CALL)`
+  with `TOKENS_PER_CALL = 130` — the safe upper bound of the two `noul` questions
+  asked about one call (measured 125 across real OpenCode tools).
+- Explicit values can only lower the derived caps, never raise them.
+
+Example — a ceiling of 12288 with the System One defaults (`maxCallsPerBatch: 32`,
+`maxStateTokens: 8000`, `maxRequestTokens: 12500`):
+
+```text
+requestBudget    11059    floor(12288 * 0.9)
+maxRequestTokens 11059    min(12500, 11059)
+questionReserve  4160     32 calls x 130 tokens each
+maxStateTokens   6899     min(8000, 11059 - 4160)
+```
+
+Without it every cap behaves exactly as before.
+
+When the whole history still cannot fit `maxStateTokens`, the plugin **slices it into
+consecutive buckets** instead of degrading it wholesale or losing the compaction: it
+cuts oldest→newest at full input quality, preferring a cut at a turn boundary so a
+bucket always opens with a user prompt, and gives a single oversized message its own
+bucket for the ladder to abridge. Every bucket is fitted, batched, and answered
+independently; the first message and the newest `preserveRecentMessages` messages are
+pinned against the **original** transcript, so they are never candidates in any bucket.
+
+**Quality**: sliced buckets trade cross-bucket context for per-message fidelity — each
+call's neighborhood arrives intact at full input detail instead of one whole-history
+state degraded to one-line call notes. The `goal` (the last user prompts) is in every
+bucket's state, so every bucket knows what the work is about.
+
+## Chunked fallback
+
+OpenCode core's compaction summarizer runs with a **131072-token window**. It is fed
+the whole transcript on the fallback path, and when that does not fit it **silently
+drops the oldest exchanges** to make the request fit — history is lost.
+
+The summarizer model is a different kind of model from the classifier, and it lives
+elsewhere. The chunked fallback runs one request per chunk against
+`fallbackBaseUrl`, so it can run alongside a pooled decision model without
+oversubscribing it.
+
+The plugin can summarize instead: set `fallbackModel` (e.g. `small_summarizer`) and,
+on any fallback path (a failed batch, a reduction below `minReductionRatio`, no
+eligible calls), when the transcript exceeds 60% of `fallbackContextTokens`, it does:
+
+1. **Chunk**: consecutive message slices whose serialized form fits 60% of
+   `fallbackContextTokens` estimated tokens. A single message over the budget is
+   head+tail truncated to fit, and the count is logged as `truncatedMessages`.
+2. **Map**: through the same `localConcurrency` cap, one chat-completions call per
+   chunk (`model: fallbackModel`, `temperature: 0`, `max_tokens: 1200`) with the
+   part prompt and the chunk's serialized text.
+3. **Reduce**: one final call (`max_tokens: 3000`) combining the part summaries in
+   order into the final checkpoint summary, using the exact section template
+   OpenCode core expects.
+4. `event.result = { summary, metadata: { plugin, backend, fallback: "chunked-summary",
+   chunks, model, transcriptTokens } }`.
+
+Any failure (transport, non-200, empty reply) — warn log, return. OpenCode's normal
+compaction path remains available.
+
+Per-request deadlines: 120s for summarizer requests, `requestTimeoutMs` (default
+180000) for classifier batches. A timed-out classifier batch fails alone; with the
+partial-answer handling the rest of the compaction survives.
 
 ## Troubleshooting
 
@@ -513,6 +602,7 @@ Each compaction ends with a `compaction outcome` line.
 | `no-eligible-completed-tool-calls` | Nothing outside the pinned window |
 | `server-error-envelope` | Endpoint returned an error envelope, sometimes with HTTP 2xx |
 | `http-request-failed` | Server rejected the request |
+| `request-timed-out` | Classifier batch hit its per-request deadline; the batch fails alone |
 | `endpoint-unreachable` | Nothing is listening at the configured endpoint |
 | `context-overflow` | Prompt exceeded the model's context |
 | `model-has-no-logprobs` | Model returned no usable probability distribution |

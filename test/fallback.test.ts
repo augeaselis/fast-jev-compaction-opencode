@@ -302,6 +302,7 @@ describe('chunked summarizer fallback (hook)', () => {
     const metadata = (event.result as { metadata: Record<string, unknown> }).metadata;
     expect(metadata.chunks).toBeGreaterThan(1);
     expect(typeof metadata.transcriptTokens).toBe('number');
+    expect(metadata.truncatedMessages).toBe(0);
     expect((event.result as { summary: string }).summary).toContain('Objective: done.');
     const summarizerCalls = fetchMock.mock.calls.filter(([, init]) =>
       !String(init?.body).includes('"state"'),
