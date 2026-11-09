@@ -59,12 +59,13 @@ export function serializeChunk(messages: readonly Message[]): string {
 const omittedMarker = (omitted: number): string => `\n[… ${omitted} chars omitted …]\n`;
 
 /**
- * Longest head+tail form of `text` estimated to fit `maxTokens`: the first
- * 90% of the kept characters are the head, the rest the tail.
+ * Longest head+tail form of `text` estimated to fit `maxTokens`: the tail
+ * keeps a quarter of the budget, the head the rest.
  */
 export function headTailTruncate(text: string, maxTokens: number): string {
   if (estimateTokens(text) <= maxTokens) return text;
-  const tailChars = Math.max(1, Math.floor(text.length / 10));
+  const charsPerToken = text.length / estimateTokens(text);
+  const tailChars = Math.max(1, Math.floor((maxTokens / 4) * charsPerToken));
   const tail = text.slice(-tailChars);
   let low = 0;
   let high = text.length - tailChars;

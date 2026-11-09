@@ -303,6 +303,11 @@ function fitEntries(params: {
   );
 }
 
+/** Sizing inputs shared by `fitState` and `fitStateBuckets`. */
+type FitOptions =
+  Pick<ResolvedCompactOptions, 'maxStateTokens' | 'preserveRecentMessages'> &
+  Partial<Pick<ResolvedCompactOptions, 'goal'>>;
+
 /**
  * Builds the Jev state from the whole conversation and shrinks it in stages
  * until it fits `maxStateTokens`. Throws when even that is too big; the
@@ -312,7 +317,7 @@ function fitEntries(params: {
 export function fitState(
   messages: readonly Message[],
   calls: readonly ToolCall[],
-  options: Pick<ResolvedCompactOptions, 'maxStateTokens' | 'preserveRecentMessages' | 'goal'>,
+  options: FitOptions,
 ): FittedState {
   const goal = options.goal || goalFromMessages(messages);
   const stateOf = (history: HistoryEntry[]): CompactionState => ({
@@ -367,7 +372,7 @@ function isTurnBoundary(entry: HistoryEntry, messages: readonly Message[]): bool
 export function fitStateBuckets(
   messages: readonly Message[],
   calls: readonly ToolCall[],
-  options: Pick<ResolvedCompactOptions, 'maxStateTokens' | 'preserveRecentMessages' | 'goal'>,
+  options: FitOptions,
 ): { buckets: StateBucket[]; sliced: boolean } {
   const pinned = (entry: HistoryEntry): boolean =>
     isPinned(entry.i, messages.length, options.preserveRecentMessages);
