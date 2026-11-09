@@ -1,5 +1,5 @@
 import { noulAnswer, PartialAnswersError } from './request.js';
-import { collectToolCalls, estimateTokens, fitState } from './state.js';
+import { collectToolCalls, estimateTokens, fitStateBuckets } from './state.js';
 import type {
   CallAnswer,
   CallDecision,
@@ -27,12 +27,24 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
 const REQUEST_OVERHEAD_TOKENS = 20;
 
+/**
+ * Share of the server's prompt ceiling held back for the chat-template
+ * overhead and the estimator's slack (`estimateTokens` lands 2–18% above true).
+ */
+export const REQUEST_MARGIN = 0.1;
+
+/**
+ * Safe upper bound of the two `noul` questions asked about one call; the
+ * measured maximum across realistic calls is what the budget test asserts.
+ */
+export const TOKENS_PER_CALL = 130;
+
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
 export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOptions {
-  return {
+  const resolved: ResolvedCompactOptions = {
     goal: options.goal ?? DEFAULT_OPTIONS.goal,
     keepThreshold: finite(options.keepThreshold, DEFAULT_OPTIONS.keepThreshold),
     preserveRecentMessages: Math.max(
@@ -55,6 +67,29 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
     ),
   };
+
+  if (
+    typeof options.serverContextTokens === 'number' &&
+    Number.isFinite(options.serverContextTokens) &&
+    options.serverContextTokens > 0
+  ) {
+    const requestBudget = Math.floor(options.serverContextTokens * (1 - REQUEST_MARGIN));
+    resolved.serverContextTokens = options.serverContextTokens;
+    resolved.requestBudget = requestBudget;
+    resolved.maxRequestTokens = Math.min(resolved.maxRequestTokens, requestBudget);
+    // One batch's questions ride along with the state in the same request, so
+    // the state may only use the request budget minus their share. Batches
+    // without a call cap are bounded by `maxRequestTokens` in `batchCalls`.
+    const questionReserve = Number.isFinite(resolved.maxCallsPerBatch)
+      ? resolved.maxCallsPerBatch * TOKENS_PER_CALL
+      : 0;
+    resolved.maxStateTokens = Math.max(
+      1,
+      Math.min(resolved.maxStateTokens, requestBudget - questionReserve),
+    );
+  }
+
+  return resolved;
 }
 
 /** The two `noul` questions asked about one call: keep the call, keep its result. */
@@ -303,14 +338,18 @@ export interface Classification {
   stateTokens: number;
   stateStage: string;
   requests: number;
+  /** How many state buckets the history was classified in (1 when unsliced). */
+  stateBuckets: number;
 }
 
 /**
  * Asks the classifier, for every tool call outside the pinned first and
  * newest messages, whether the call and whether its result must stay. The
- * whole history (results omitted, fitted into `maxStateTokens`) is sent as
- * state with every batch of questions. Failed batches are collected, not
- * thrown; a history that cannot be fitted throws.
+ * history (results omitted) is fitted into one state bucket, or — when the
+ * whole history cannot fit — into consecutive buckets sliced at turn
+ * boundaries, each sent with its own batches of questions. Failed batches are
+ * collected, not thrown; a single pathological bucket that cannot even be
+ * sliced into a fitting state still throws.
  */
 export async function classifyCalls(
   messages: readonly Message[],
@@ -328,15 +367,23 @@ export async function classifyCalls(
     stateTokens: 0,
     stateStage: '',
     requests: 0,
+    stateBuckets: 0,
   };
   if (candidates.length === 0) return classification;
-  const state = fitState(messages, calls, resolved);
-  classification.stateTokens = state.tokens;
-  classification.stateStage = state.stage;
-  const batches = batchCalls(candidates, state.tokens, resolved);
-  classification.requests = batches.length;
+
+  const { buckets, sliced } = fitStateBuckets(messages, calls, resolved);
+  classification.stateBuckets = buckets.length;
+  classification.stateTokens = Math.max(...buckets.map((bucket) => bucket.tokens));
+  classification.stateStage = sliced
+    ? `sliced x${buckets.length}: ${buckets.map((bucket) => bucket.stage).join(', ')}`
+    : buckets[0]!.stage;
+
+  const requests = buckets.flatMap((bucket) =>
+    batchCalls(bucket.candidates, bucket.tokens, resolved).map((batch) => ({ bucket, batch })),
+  );
+  classification.requests = requests.length;
   const settled = await Promise.allSettled(
-    batches.map((batch) => askBatch(asker, state.state, batch)),
+    requests.map(({ bucket, batch }) => askBatch(asker, bucket.state, batch)),
   );
   settled.forEach((outcome, index) => {
     let map: Map<string, CallAnswer> | undefined;
@@ -344,7 +391,7 @@ export async function classifyCalls(
     else {
       const reason: unknown = outcome.reason;
       if (reason instanceof PartialAnswersError) {
-        map = partialAnswers(batches[index]!, reason.answers);
+        map = partialAnswers(requests[index]!.batch, reason.answers);
         if (reason.timedOut) classification.timedOut = true;
         else classification.failures.push(reason);
       } else classification.failures.push(reason);
@@ -392,6 +439,7 @@ export function compactWithAnswers(
       stateTokens: classification.stateTokens ?? 0,
       stateStage: classification.stateStage ?? '',
       requests: classification.requests ?? 0,
+      stateBuckets: classification.stateBuckets ?? 0,
       ms: Date.now() - started,
     },
   };
