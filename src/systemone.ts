@@ -10,6 +10,15 @@ export const LOCAL_SYSTEM_ONE_BASE_URL = 'http://127.0.0.1:1234/v1';
 export const SYSTEM_ONE_MAX_REQUEST_BYTES = 60 * 1024;
 export const SYSTEM_ONE_MAX_QUESTIONS = 64;
 
+/** Bound on one batch request, so a hung server cannot stall a compaction. */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 180_000;
+
+/** True when a failed fetch died at its deadline rather than on an error. */
+export function isRequestTimeout(error: unknown): boolean {
+  const name = error instanceof Error ? error.name : '';
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
 /** Accept an origin, a /v1 base URL, or a complete /v1/systemone URL. */
 export function systemOneEndpoint(baseUrl = LOCAL_SYSTEM_ONE_BASE_URL): string {
   const url = baseUrl.replace(/\/+$/, '');
@@ -28,6 +37,8 @@ export interface SystemOneClientOptions {
   /** Conservative Ollama-compatible cap (overridable in tests). */
   maxRequestBytes?: number;
   maxQuestions?: number;
+  /** Per-request deadline in ms; a timed-out batch fails alone. Default 180000. */
+  requestTimeoutMs?: number;
 }
 
 export type SystemOneBatch = { body: string; names: string[] };
@@ -80,6 +91,7 @@ export class SystemOneClient implements JevAsker {
   private readonly fetcher: typeof fetch;
   private readonly maxRequestBytes: number;
   private readonly maxQuestions: number;
+  private readonly requestTimeoutMs: number;
 
   constructor(options: SystemOneClientOptions) {
     this.model = options.model.trim();
@@ -88,6 +100,7 @@ export class SystemOneClient implements JevAsker {
     this.fetcher = options.fetch ?? fetch;
     this.maxRequestBytes = options.maxRequestBytes ?? SYSTEM_ONE_MAX_REQUEST_BYTES;
     this.maxQuestions = options.maxQuestions ?? SYSTEM_ONE_MAX_QUESTIONS;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   }
 
   async ask(state: JevState, questions: JevQuestions): Promise<JevResponse> {
@@ -111,6 +124,7 @@ export class SystemOneClient implements JevAsker {
           method: 'POST',
           headers,
           body: batch.body,
+          signal: AbortSignal.timeout(this.requestTimeoutMs),
         });
         const result = parseJevResponse(response.status, response.ok, await response.text());
         for (const name of batch.names) {
@@ -125,7 +139,11 @@ export class SystemOneClient implements JevAsker {
       } catch (error) {
         // No decision is discarded without both answers; preserve partial work.
         throw new PartialAnswersError(
-          error instanceof Error ? error.message : String(error),
+          isRequestTimeout(error)
+            ? `System One request timed out after ${this.requestTimeoutMs} ms`
+            : error instanceof Error
+              ? error.message
+              : String(error),
           { ...answers },
         );
       }

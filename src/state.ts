@@ -152,10 +152,13 @@ function historyEntries(
   messages: readonly Message[],
   calls: readonly ToolCall[],
   inputChars: number,
+  first = 0,
+  last = messages.length - 1,
 ): HistoryEntry[] {
   const byMessage = callsByMessage(calls);
   const entries: HistoryEntry[] = [];
   messages.forEach((message, i) => {
+    if (i < first || i > last) return;
     const toolCalls = (byMessage.get(i) ?? []).map((call) => ({
       id: call.id,
       tool: call.tool,
@@ -185,26 +188,26 @@ export function goalFromMessages(messages: readonly Message[]): string {
 }
 
 /**
- * Builds the Jev state from the whole conversation and shrinks it in stages
- * until it fits `maxStateTokens`: tool inputs are truncated, then long texts
- * are abridged oldest-first (pinned messages last), then old messages collapse
- * to a one-line note, then old tool calls shrink to one line each, then old
- * messages that carry no call are left out, then runs of old call-only
- * messages are folded into one entry. Throws when even that is too big.
+ * The shrink ladder shared by the whole-history and per-bucket fitters:
+ * rebuild the history at lower input caps, abridge long texts oldest-first
+ * (pinned last), collapse old messages to a one-line note, shrink old tool
+ * calls to one line each, leave out old messages that carry no call, and fold
+ * runs of old call-only messages into one entry — until the state fits
+ * `maxTokens`. Throws when even that is too big.
  */
-export function fitState(
-  messages: readonly Message[],
-  calls: readonly ToolCall[],
-  options: Pick<ResolvedCompactOptions, 'maxStateTokens' | 'preserveRecentMessages' | 'goal'>,
-): FittedState {
-  const goal = options.goal || goalFromMessages(messages);
-  const stateOf = (history: HistoryEntry[]): CompactionState => ({
-    context: STATE_CONTEXT,
-    goal,
-    history,
-  });
+function fitEntries(params: {
+  stateOf: (history: HistoryEntry[]) => CompactionState;
+  /** Rebuilds the entry list at a lower serialised-input cap. */
+  rebuild: (inputChars: number) => HistoryEntry[];
+  baseTokens: number;
+  maxTokens: number;
+  /** Pinned entries are degraded last and never collapsed or left out. */
+  pinned: (entry: HistoryEntry) => boolean;
+  originalTextLength: (entry: HistoryEntry) => number;
+  callsOfMessage: (messageIndex: number) => readonly ToolCall[];
+}): FittedState {
+  const { stateOf, rebuild, baseTokens, maxTokens, pinned } = params;
   const entryTokens = (entry: HistoryEntry): number => estimateTokens(JSON.stringify(entry)) + 1;
-  const baseTokens = estimateTokens(JSON.stringify(stateOf([])));
   const fitted = (history: HistoryEntry[], tokens: number, stage: string): FittedState => ({
     state: stateOf(history),
     tokens,
@@ -214,12 +217,12 @@ export function fitState(
   let history: HistoryEntry[] = [];
   let perEntry: number[] = [];
   let tokens = 0;
-  const rebuild = (inputChars: number): void => {
-    history = historyEntries(messages, calls, inputChars);
+  const rebuildAt = (inputChars: number): void => {
+    history = rebuild(inputChars);
     perEntry = history.map(entryTokens);
     tokens = baseTokens + perEntry.reduce((sum, n) => sum + n, 0);
   };
-  const fits = (): boolean => tokens <= options.maxStateTokens;
+  const fits = (): boolean => tokens <= maxTokens;
   const shrink = (index: number, change: (entry: HistoryEntry) => void): void => {
     const entry = history[index];
     if (!entry) return;
@@ -229,16 +232,14 @@ export function fitState(
     perEntry[index] = now;
   };
 
-  rebuild(INPUT_CHARS[0]);
+  rebuildAt(INPUT_CHARS[0]);
   if (fits()) return fitted(history, tokens, 'full');
 
   for (const limit of INPUT_CHARS.slice(1)) {
-    rebuild(limit);
+    rebuildAt(limit);
     if (fits()) return fitted(history, tokens, `inputs<=${limit}`);
   }
 
-  const pinned = (entry: HistoryEntry): boolean =>
-    isPinned(entry.i, messages.length, options.preserveRecentMessages);
   const indices = history.map((_, index) => index);
   const order = [
     ...indices.filter((index) => !pinned(history[index]!)),
@@ -257,18 +258,17 @@ export function fitState(
   for (const index of order) {
     const entry = history[index]!;
     if (pinned(entry) || entry.text.length === 0) continue;
-    const original = messages[entry.i]?.text.length ?? entry.text.length;
+    const original = params.originalTextLength(entry);
     shrink(index, (e) => {
       e.text = `[… ${original} chars omitted …]`;
     });
     if (fits()) return fitted(history, tokens, 'old messages collapsed');
   }
 
-  const byMessage = callsByMessage(calls);
   for (const index of order) {
     const entry = history[index]!;
-    const own = byMessage.get(entry.i);
-    if (pinned(entry) || !own) continue;
+    const own = params.callsOfMessage(entry.i);
+    if (pinned(entry) || own.length === 0) continue;
     shrink(index, (e) => {
       e.tool_calls = own.map(compactCall);
     });
@@ -299,6 +299,162 @@ export function fitState(
   if (fits()) return fitted(history, tokens, 'old calls merged');
 
   throw new Error(
-    `history too large for Jev (~${tokens} tokens after truncation, limit ${options.maxStateTokens})`,
+    `history too large for Jev (~${tokens} tokens after truncation, limit ${maxTokens})`,
   );
+}
+
+/** Sizing inputs shared by `fitState` and `fitStateBuckets`. */
+type FitOptions =
+  Pick<ResolvedCompactOptions, 'maxStateTokens' | 'preserveRecentMessages'> &
+  Partial<Pick<ResolvedCompactOptions, 'goal'>>;
+
+/**
+ * Builds the Jev state from the whole conversation and shrinks it in stages
+ * until it fits `maxStateTokens`. Throws when even that is too big; the
+ * bucketing fitter (`fitStateBuckets`) is the caller that never throws
+ * wholesale.
+ */
+export function fitState(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  options: FitOptions,
+): FittedState {
+  const goal = options.goal || goalFromMessages(messages);
+  const stateOf = (history: HistoryEntry[]): CompactionState => ({
+    context: STATE_CONTEXT,
+    goal,
+    history,
+  });
+  const byMessage = callsByMessage(calls);
+  return fitEntries({
+    stateOf,
+    baseTokens: estimateTokens(JSON.stringify(stateOf([]))),
+    maxTokens: options.maxStateTokens,
+    rebuild: (inputChars) => historyEntries(messages, calls, inputChars),
+    pinned: (entry) => isPinned(entry.i, messages.length, options.preserveRecentMessages),
+    originalTextLength: (entry) => messages[entry.i]?.text.length ?? entry.text.length,
+    callsOfMessage: (messageIndex) => byMessage.get(messageIndex) ?? [],
+  });
+}
+
+/** One slice of the history, classified with its own state and batches. */
+export interface StateBucket {
+  state: CompactionState;
+  tokens: number;
+  stage: string;
+  /** Non-pinned calls whose `callIndex` falls inside this bucket's messages. */
+  candidates: ToolCall[];
+}
+
+/**
+ * A user prompt opens a turn; slicing prefers to cut just before one, so a
+ * bucket never opens mid-conversation.
+ */
+function isTurnBoundary(entry: HistoryEntry, messages: readonly Message[]): boolean {
+  const message = messages[entry.i];
+  return (
+    entry.role === 'user' &&
+    entry.text.length > 0 &&
+    (message?.toolResults ?? []).length === 0
+  );
+}
+
+/**
+ * Fits the history for classification. When the whole-history state fits, it
+ * is the single bucket (built by the same ladder as `fitState`). Otherwise the
+ * history is sliced oldest→newest at full input quality into consecutive
+ * buckets that each fit `maxStateTokens` — preferring a cut at a turn
+ * boundary, and giving a single oversized message its own bucket for the
+ * ladder to degrade. Pinning is always computed against the original
+ * transcript, so the newest `preserveRecentMessages` messages and the first
+ * message are never candidates in any bucket.
+ */
+export function fitStateBuckets(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  options: FitOptions,
+): { buckets: StateBucket[]; sliced: boolean } {
+  const pinned = (entry: HistoryEntry): boolean =>
+    isPinned(entry.i, messages.length, options.preserveRecentMessages);
+  const nonPinned = calls.filter((call) => !call.pinned);
+
+  try {
+    const fitted = fitState(messages, calls, options);
+    return {
+      buckets: [{ ...fitted, candidates: nonPinned }],
+      sliced: false,
+    };
+  } catch {
+    // The whole-history state cannot fit; slice it up instead of losing the
+    // compaction.
+  }
+
+  const goal = options.goal || goalFromMessages(messages);
+  const stateOf = (history: HistoryEntry[]): CompactionState => ({
+    context: STATE_CONTEXT,
+    goal,
+    history,
+  });
+  const baseTokens = estimateTokens(JSON.stringify(stateOf([])));
+  const entries = historyEntries(messages, calls, INPUT_CHARS[0]);
+  if (entries.length === 0) {
+    return {
+      buckets: [{ state: stateOf([]), tokens: baseTokens, stage: 'full', candidates: nonPinned }],
+      sliced: false,
+    };
+  }
+
+  const entryTokens = (entry: HistoryEntry): number => estimateTokens(JSON.stringify(entry)) + 1;
+  const prefix: number[] = [0];
+  for (const entry of entries) {
+    prefix.push(prefix[prefix.length - 1]! + entryTokens(entry));
+  }
+  // The state envelope (context + goal skeleton) is paid once per bucket, so
+  // the entries under it must leave room for it.
+  const target = Math.max(1, options.maxStateTokens - baseTokens);
+
+  const ranges: Array<[number, number]> = [];
+  let start = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const bucketTokens = prefix[i]! - prefix[start]! + entryTokens(entries[i]!);
+    if (i > start && bucketTokens > target) {
+      // Cut before the overflowing entry, at the newest turn boundary in the
+      // bucket when there is one.
+      let cut = i;
+      for (let c = i; c > start; c--) {
+        if (isTurnBoundary(entries[c]!, messages)) {
+          cut = c;
+          break;
+        }
+      }
+      ranges.push([start, cut]);
+      start = cut;
+    }
+  }
+  if (start < entries.length) ranges.push([start, entries.length]);
+
+  const byMessage = callsByMessage(calls);
+  const buckets = ranges.map(([from, to]) => {
+    const first = entries[from]!.i;
+    const last = entries[to - 1]!.i;
+    const inRange = (call: ToolCall): boolean =>
+      call.callIndex >= first && call.callIndex <= last;
+    const fitted = fitEntries({
+      stateOf,
+      baseTokens,
+      maxTokens: options.maxStateTokens,
+      pinned,
+      rebuild: (inputChars) =>
+        historyEntries(messages, calls.filter(inRange), inputChars, first, last),
+      originalTextLength: (entry) => messages[entry.i]?.text.length ?? entry.text.length,
+      callsOfMessage: (messageIndex) => byMessage.get(messageIndex) ?? [],
+    });
+    return {
+      state: fitted.state,
+      tokens: fitted.tokens,
+      stage: fitted.stage,
+      candidates: nonPinned.filter(inRange),
+    };
+  });
+  return { buckets, sliced: true };
 }

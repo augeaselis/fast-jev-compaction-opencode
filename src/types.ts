@@ -107,6 +107,12 @@ export interface CompactOptions {
   maxCallsPerBatch?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
+  /**
+   * The decision server's binding prompt ceiling (its `max_model_len`). When
+   * set, `maxRequestTokens` and `maxStateTokens` are capped to a margin below
+   * it; explicit values can still lower them.
+   */
+  serverContextTokens?: number;
 }
 
 export interface ResolvedCompactOptions {
@@ -117,6 +123,10 @@ export interface ResolvedCompactOptions {
   maxRequestTokens: number;
   maxCallsPerBatch: number;
   truncateHeadChars: number;
+  /** The configured server ceiling; undefined when none was configured. */
+  serverContextTokens?: number;
+  /** `floor(serverContextTokens * (1 - REQUEST_MARGIN))`; undefined when unset. */
+  requestBudget?: number;
 }
 
 export interface CompactResult {
@@ -137,6 +147,8 @@ export interface CompactResult {
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;
     requests: number;
+    /** How many state buckets the history was classified in (1 when unsliced). */
+    stateBuckets: number;
     ms: number;
   };
 }

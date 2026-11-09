@@ -1,11 +1,18 @@
 import { Plugin } from '@opencode/plugin';
 
 import { JevClient } from './client.js';
-import { compact, reductionRatio, resolveOptions } from './compact.js';
+import { PartialCompactionError, compact, reductionRatio, resolveOptions } from './compact.js';
+import { CHUNK_SHARE, FALLBACK_CONTEXT_TOKENS, chunkedSummary, serializeChunk } from './fallback.js';
 import { LOCAL_BASE_URL, LOCAL_MODEL, LocalJevAsker, createScheduler } from './local.js';
 import { createLogger, defaultLogPath, errorSummary, safeUrl, type Logger } from './log.js';
-import { collectToolCalls } from './state.js';
-import { LOCAL_SYSTEM_ONE_BASE_URL, SystemOneClient, systemOneEndpoint } from './systemone.js';
+import { collectToolCalls, estimateTokens } from './state.js';
+import {
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  LOCAL_SYSTEM_ONE_BASE_URL,
+  SystemOneClient,
+  isRequestTimeout,
+  systemOneEndpoint,
+} from './systemone.js';
 import type { CompactOptions, CompactResult, JevAsker, Message } from './types.js';
 
 type Backend = 'typesafe' | 'local' | 'systemone';
@@ -62,6 +69,13 @@ export interface FastJevConfig extends CompactOptions {
   localConcurrency: number;
   localContextTokens: number;
   minReductionRatio: number;
+  /** Model for the plugin's chunked summarizer fallback; unset = core handles it. */
+  fallbackModel?: string;
+  /** Defaults to `localBaseUrl`. */
+  fallbackBaseUrl?: string;
+  /** Defaults to `localApiKey`. */
+  fallbackApiKey?: string;
+  fallbackContextTokens: number;
 }
 
 const DEFAULTS = {
@@ -69,6 +83,7 @@ const DEFAULTS = {
   localConcurrency: 2,
   localContextTokens: 64_000,
   minReductionRatio: 0.25,
+  fallbackContextTokens: FALLBACK_CONTEXT_TOKENS,
 };
 
 function stringOption(options: PluginOptions, key: string): string | undefined {
@@ -88,6 +103,7 @@ export function resolveConfig(options: PluginOptions = {}): FastJevConfig {
     localConcurrency: Math.max(1, Math.floor(numberOption(options, 'localConcurrency', DEFAULTS.localConcurrency))),
     localContextTokens: Math.max(1, numberOption(options, 'localContextTokens', DEFAULTS.localContextTokens)),
     minReductionRatio: Math.max(0, Math.min(1, numberOption(options, 'minReductionRatio', DEFAULTS.minReductionRatio))),
+    fallbackContextTokens: Math.max(1, numberOption(options, 'fallbackContextTokens', DEFAULTS.fallbackContextTokens)),
   };
 
   // Smaller default state avoids exceeding Ollama's 64 KiB text/schema limit.
@@ -106,6 +122,7 @@ export function resolveConfig(options: PluginOptions = {}): FastJevConfig {
     'maxRequestTokens',
     'maxCallsPerBatch',
     'truncateHeadChars',
+    'serverContextTokens',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) config[key] = value;
@@ -120,6 +137,9 @@ export function resolveConfig(options: PluginOptions = {}): FastJevConfig {
     'localApiKey',
     'logFile',
     'goal',
+    'fallbackModel',
+    'fallbackBaseUrl',
+    'fallbackApiKey',
   ] as const) {
     const value = stringOption(options, key);
     if (value) config[key] = value;
@@ -211,14 +231,6 @@ export function toCompactionMessages(messages: readonly NativeMessage[]): Messag
   });
 }
 
-function json(value: unknown): string {
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return '[unserializable]';
-  }
-}
-
 /**
  * OpenCode V2's compaction override accepts a summary string rather than an
  * arbitrary replacement message list. Serialize the JEV-pruned transcript
@@ -226,33 +238,11 @@ function json(value: unknown): string {
  * verbatim instead of asking another model to rewrite it.
  */
 export function serializeCompaction(messages: readonly Message[]): string {
-  const out: string[] = [
-    '[fast-jev-compaction checkpoint: retained conversation follows verbatim; no model summary was generated]',
-  ];
-
-  for (const message of messages) {
-    out.push('', '<' + message.role + '>');
-    if (message.text.length > 0) out.push(message.text);
-
-    for (const tool of message.toolUses) {
-      out.push('[tool-call id=' + tool.tool_use_id + ' name=' + tool.tool + ']');
-      out.push(json(tool.input));
-      if (tool.text !== undefined) {
-        out.push('[tool-result id=' + tool.tool_use_id + (tool.isError ? ' error=true' : '') + ']');
-        out.push(tool.text);
-      }
-    }
-
-    for (const result of message.toolResults ?? []) {
-      if (message.toolUses.some((tool) => tool.tool_use_id === result.tool_use_id)) continue;
-      out.push('[tool-result id=' + result.tool_use_id + (result.isError ? ' error=true' : '') + ']');
-      out.push(result.text);
-    }
-
-    out.push('</' + message.role + '>');
-  }
-
-  return out.join('\n');
+  const header =
+    '[fast-jev-compaction checkpoint: retained conversation follows verbatim; no model summary was generated]';
+  return messages.length === 0
+    ? header
+    : `${header}\n\n${serializeChunk(messages)}`;
 }
 
 function partCensus(messages: readonly NativeMessage[]): {
@@ -296,6 +286,11 @@ export function createAsker(config: FastJevConfig, logger: Logger): JevAsker {
             durationMs: Date.now() - started,
             ...errorSummary(error),
           });
+          if (isRequestTimeout(error)) {
+            throw new Error(
+              `System One request timed out after ${DEFAULT_REQUEST_TIMEOUT_MS} ms`,
+            );
+          }
           throw new Error(
             `local System One unreachable at ${String(url)}: ${error instanceof Error ? error.message : String(error)}`,
           );
@@ -379,6 +374,9 @@ export const FastJevCompaction = Plugin.define({
     const logFile = config.logFile ?? defaultLogPath();
     const logger = createLogger(logFile);
     const asker = createAsker(config, logger);
+    // The chunked fallback maps its part requests through this cap too, so a
+    // summarizing compaction cannot oversubscribe the endpoint either.
+    const fallbackSchedule = createScheduler(config.localConcurrency);
     const backendDetails =
       config.backend === 'local' || config.backend === 'systemone'
         ? {
@@ -400,16 +398,95 @@ export const FastJevCompaction = Plugin.define({
       localContextTokens: config.localContextTokens,
       preserveRecentMessages: resolved.preserveRecentMessages,
       keepThreshold: resolved.keepThreshold,
+      serverContextTokens: resolved.serverContextTokens,
+      requestBudget: resolved.requestBudget,
       maxStateTokens: resolved.maxStateTokens,
       maxRequestTokens: resolved.maxRequestTokens,
       truncateHeadChars: resolved.truncateHeadChars,
       minReductionRatio: config.minReductionRatio,
+      fallbackModel: config.fallbackModel,
       logFile,
     });
 
     await ctx.session.hook('compaction', async (event) => {
       const sessionID = event.sessionID;
       const nativeMessages = event.messages as unknown as NativeMessage[];
+      let transcript: Message[] | undefined;
+
+      /**
+       * The plugin's chunked summarizer fallback: OpenCode core's compaction
+       * summarizer has a finite window and would silently drop the oldest
+       * history to fit, so an oversized transcript is summarized here instead.
+       * Any failure leaves the fallback to core, as when `fallbackModel` is
+       * unset.
+       */
+      const runChunkedFallback = async (): Promise<void> => {
+        const adapted = transcript ?? toCompactionMessages(nativeMessages);
+        if (!config.fallbackModel || adapted.length === 0) return;
+        const transcriptTokens = estimateTokens(serializeCompaction(adapted));
+        if (transcriptTokens <= Math.floor(config.fallbackContextTokens * CHUNK_SHARE)) return;
+        try {
+          const summary = await chunkedSummary(adapted, {
+            baseUrl: config.fallbackBaseUrl ?? config.localBaseUrl ?? LOCAL_BASE_URL,
+            model: config.fallbackModel,
+            apiKey: config.fallbackApiKey ?? config.localApiKey,
+            schedule: fallbackSchedule,
+            fetch,
+            contextTokens: config.fallbackContextTokens,
+          });
+          event.result = {
+            summary: summary.summary,
+            metadata: {
+              plugin: 'fast-jev-compaction-opencode',
+              backend: config.backend,
+              fallback: 'chunked-summary',
+              chunks: summary.chunkCount,
+              model: config.fallbackModel,
+              transcriptTokens,
+              truncatedMessages: summary.truncatedMessages,
+            },
+          };
+          logger.info('compaction outcome', {
+            session: sessionID,
+            outcome: 'override',
+            fallback: 'chunked-summary',
+            chunks: summary.chunkCount,
+            truncatedMessages: summary.truncatedMessages,
+            transcriptTokens,
+          });
+        } catch (error) {
+          logger.warn('chunked fallback failed', {
+            session: sessionID,
+            ...errorSummary(error),
+          });
+        }
+      };
+
+      const shipOverride = (result: CompactResult, ratio: number, candidateCount: number, partial: boolean): void => {
+        event.result = {
+          summary: serializeCompaction(result.messages),
+          metadata: {
+            plugin: 'fast-jev-compaction-opencode',
+            backend: config.backend,
+            calls: result.stats.calls,
+            candidateCalls: candidateCount,
+            pinned: result.stats.pinned,
+            jevBatches: result.stats.requests,
+            kept: result.stats.kept,
+            resultsDropped: result.stats.resultsDropped,
+            callsDropped: result.stats.callsDropped,
+            reductionRatio: ratio,
+            ...(partial ? { partial: true } : {}),
+          },
+        };
+        logger.info('compaction outcome', {
+          session: sessionID,
+          outcome: 'override',
+          backend: config.backend,
+          reduction: percent(ratio),
+          ...(partial ? { partial: true } : {}),
+        });
+      };
 
       try {
         const census = partCensus(nativeMessages);
@@ -421,7 +498,7 @@ export const FastJevCompaction = Plugin.define({
           backend: config.backend,
         });
 
-        const transcript = toCompactionMessages(nativeMessages);
+        transcript = toCompactionMessages(nativeMessages);
         const calls = collectToolCalls(transcript, resolved.preserveRecentMessages);
         const candidateCalls = calls.filter((call) => !call.pinned).length;
         logger.info('transcript adapted', {
@@ -442,14 +519,30 @@ export const FastJevCompaction = Plugin.define({
           return;
         }
 
-        const result = await compact(transcript, asker, config);
-        if (!result) {
-          logger.info('compaction outcome', {
+        let result: CompactResult;
+        try {
+          result = await compact(transcript, asker, config);
+        } catch (error) {
+          if (!(error instanceof PartialCompactionError)) throw error;
+          // A failed batch must not discard the batches that answered: the
+          // result already applies every answered batch, the rest kept.
+          result = error.result;
+          const partialRatio = reductionRatio(result);
+          if (partialRatio >= config.minReductionRatio) {
+            logger.warn('partial compaction shipped', {
+              session: sessionID,
+              ...errorSummary(error),
+              reduction: percent(partialRatio),
+            });
+            shipOverride(result, partialRatio, candidateCalls, true);
+            return;
+          }
+          logger.warn('partial compaction below minimum', {
             session: sessionID,
-            outcome: 'fallback',
-            reason: 'no-compaction-result',
+            ...errorSummary(error),
+            reduction: percent(partialRatio),
+            minimum: percent(config.minReductionRatio),
           });
-          return;
         }
 
         const ratio = reductionRatio(result);
@@ -461,6 +554,7 @@ export const FastJevCompaction = Plugin.define({
           jevBatches: result.stats.requests,
           stateTokens: result.stats.stateTokens,
           stateStage: result.stats.stateStage,
+          stateBuckets: result.stats.stateBuckets,
           reduction: percent(ratio),
         });
 
@@ -476,37 +570,18 @@ export const FastJevCompaction = Plugin.define({
             reduction: percent(ratio),
             minimum: percent(config.minReductionRatio),
           });
+          await runChunkedFallback();
           return;
         }
 
-        event.result = {
-          summary: serializeCompaction(result.messages),
-          metadata: {
-            plugin: 'fast-jev-compaction-opencode',
-            backend: config.backend,
-            calls: result.stats.calls,
-            candidateCalls,
-            pinned: result.stats.pinned,
-            jevBatches: result.stats.requests,
-            kept: result.stats.kept,
-            resultsDropped: result.stats.resultsDropped,
-            callsDropped: result.stats.callsDropped,
-            reductionRatio: ratio,
-          },
-        };
-
-        logger.info('compaction outcome', {
-          session: sessionID,
-          outcome: 'override',
-          backend: config.backend,
-          reduction: percent(ratio),
-        });
+        shipOverride(result, ratio, candidateCalls, false);
       } catch (error) {
         logger.warn('compaction outcome', {
           session: sessionID,
           outcome: 'fallback',
           ...errorSummary(error),
         });
+        await runChunkedFallback();
       }
     });
   },
